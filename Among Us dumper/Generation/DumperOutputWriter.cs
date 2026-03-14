@@ -1,0 +1,787 @@
+using System.CodeDom.Compiler;
+using System.Text;
+using System.Text.Json;
+using AmongUsDumper.Analysis;
+using AmongUsDumper.Cli;
+using AmongUsDumper.Logging;
+
+namespace AmongUsDumper.Generation;
+
+internal sealed class DumperOutputWriter
+{
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+    };
+
+    private readonly AppLogger _logger;
+
+    public DumperOutputWriter(AppLogger logger)
+    {
+        _logger = logger;
+    }
+
+    public void WriteAll(AnalysisResult result, Options options)
+    {
+        Directory.CreateDirectory(options.OutputDirectory);
+
+        foreach (var fileType in options.FileTypes)
+        {
+            var filePath = Path.Combine(options.OutputDirectory, $"offsets.{fileType}");
+            File.WriteAllText(filePath, RenderOffsets(result.Offsets, fileType, options.IndentSize), Encoding.UTF8);
+        }
+
+        foreach (var (moduleName, schema) in result.Schemas)
+        {
+            var slug = Slugify(moduleName);
+
+            foreach (var fileType in options.FileTypes)
+            {
+                var filePath = Path.Combine(options.OutputDirectory, $"{slug}.{fileType}");
+                File.WriteAllText(filePath, RenderSchemaModule(moduleName, schema, fileType, options.IndentSize), Encoding.UTF8);
+            }
+        }
+
+        var infoPath = Path.Combine(options.OutputDirectory, "info.json");
+        File.WriteAllText(infoPath, JsonSerializer.Serialize(result.Info, JsonOptions), Encoding.UTF8);
+
+        _logger.Info($"wrote output to {Path.GetFullPath(options.OutputDirectory)}");
+    }
+
+    private static string RenderOffsets(
+        SortedDictionary<string, SortedDictionary<string, ulong>> offsets,
+        string fileType,
+        int indentSize)
+    {
+        return fileType switch
+        {
+            "json" => JsonSerializer.Serialize(offsets, JsonOptions),
+            "cs" => RenderCsOffsets(offsets, indentSize),
+            "hpp" => RenderCppOffsets(offsets, indentSize),
+            "rs" => RenderRustOffsets(offsets, indentSize),
+            "zig" => RenderZigOffsets(offsets, indentSize),
+            _ => throw new NotSupportedException($"Unsupported file type: {fileType}"),
+        };
+    }
+
+    private static string RenderSchemaModule(
+        string moduleName,
+        ModuleSchema schema,
+        string fileType,
+        int indentSize)
+    {
+        return fileType switch
+        {
+            "json" => RenderJsonSchema(moduleName, schema),
+            "cs" => RenderCsSchema(moduleName, schema, indentSize),
+            "hpp" => RenderCppSchema(moduleName, schema, indentSize),
+            "rs" => RenderRustSchema(moduleName, schema, indentSize),
+            "zig" => RenderZigSchema(moduleName, schema, indentSize),
+            _ => throw new NotSupportedException($"Unsupported file type: {fileType}"),
+        };
+    }
+
+    private static string RenderJsonSchema(string moduleName, ModuleSchema schema)
+    {
+        var classes = schema.Classes.ToDictionary(
+            pair => pair.Key,
+            pair => new
+            {
+                name = pair.Value.Name,
+                @namespace = pair.Value.Namespace,
+                parent = pair.Value.Parent,
+                size = pair.Value.Size,
+                fields = pair.Value.Fields.ToDictionary(field => field.Key, field => field.Value.Offset),
+                static_fields = pair.Value.StaticFields.ToDictionary(field => field.Key, field => field.Value.Offset),
+                field_types = pair.Value.Fields.ToDictionary(field => field.Key, field => field.Value.TypeName),
+                static_field_types = pair.Value.StaticFields.ToDictionary(field => field.Key, field => field.Value.TypeName),
+                methods = pair.Value.Methods.ToDictionary(method => method.Key, method => method.Value.Rva),
+                method_signatures = pair.Value.Methods.ToDictionary(method => method.Key, method => method.Value.Signature),
+            });
+
+        var enums = schema.Enums.ToDictionary(
+            pair => pair.Key,
+            pair => new
+            {
+                name = pair.Value.Name,
+                @namespace = pair.Value.Namespace,
+                underlying_type = pair.Value.UnderlyingType,
+                alignment = pair.Value.Alignment,
+                size = pair.Value.Size,
+                members = pair.Value.Members,
+            });
+
+        var document = new Dictionary<string, object?>
+        {
+            [moduleName] = new
+            {
+                classes,
+                enums,
+            },
+        };
+
+        return JsonSerializer.Serialize(document, JsonOptions);
+    }
+
+    private static string RenderCsOffsets(
+        SortedDictionary<string, SortedDictionary<string, ulong>> offsets,
+        int indentSize)
+    {
+        using var stringWriter = new StringWriter();
+        using var writer = CreateWriter(stringWriter, indentSize);
+
+        writer.WriteLine("// Generated by Among Us dumper");
+        writer.WriteLine();
+        writer.WriteLine("namespace AmongUsDumper.Offsets");
+        writer.WriteLine("{");
+        writer.Indent++;
+
+        foreach (var (moduleName, values) in offsets)
+        {
+            writer.WriteLine($"// Module: {moduleName}");
+            writer.WriteLine($"public static class {ToPascalCase(moduleName)}");
+            writer.WriteLine("{");
+            writer.Indent++;
+
+            foreach (var (name, value) in values)
+            {
+                writer.WriteLine($"public const nint {SanitizeIdentifier(name)} = 0x{value:X};");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        writer.Indent--;
+        writer.WriteLine("}");
+
+        return stringWriter.ToString();
+    }
+
+    private static string RenderCppOffsets(
+        SortedDictionary<string, SortedDictionary<string, ulong>> offsets,
+        int indentSize)
+    {
+        using var stringWriter = new StringWriter();
+        using var writer = CreateWriter(stringWriter, indentSize);
+
+        writer.WriteLine("#pragma once");
+        writer.WriteLine();
+        writer.WriteLine("#include <cstddef>");
+        writer.WriteLine("#include <cstdint>");
+        writer.WriteLine();
+        writer.WriteLine("namespace amongus_dumper::offsets");
+        writer.WriteLine("{");
+        writer.Indent++;
+
+        foreach (var (moduleName, values) in offsets)
+        {
+            writer.WriteLine($"// Module: {moduleName}");
+            writer.WriteLine($"namespace {ToSnakeCase(moduleName)}");
+            writer.WriteLine("{");
+            writer.Indent++;
+
+            foreach (var (name, value) in values)
+            {
+                writer.WriteLine($"constexpr std::ptrdiff_t {SanitizeIdentifier(name)} = 0x{value:X};");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        writer.Indent--;
+        writer.WriteLine("}");
+
+        return stringWriter.ToString();
+    }
+
+    private static string RenderRustOffsets(
+        SortedDictionary<string, SortedDictionary<string, ulong>> offsets,
+        int indentSize)
+    {
+        using var stringWriter = new StringWriter();
+        using var writer = CreateWriter(stringWriter, indentSize);
+
+        writer.WriteLine("#![allow(non_upper_case_globals, unused)]");
+        writer.WriteLine();
+        writer.WriteLine("pub mod amongus_dumper {");
+        writer.Indent++;
+        writer.WriteLine("pub mod offsets {");
+        writer.Indent++;
+
+        foreach (var (moduleName, values) in offsets)
+        {
+            writer.WriteLine($"// Module: {moduleName}");
+            writer.WriteLine($"pub mod {ToSnakeCase(moduleName)} {{");
+            writer.Indent++;
+
+            foreach (var (name, value) in values)
+            {
+                writer.WriteLine($"pub const {SanitizeIdentifier(name)}: usize = 0x{value:X};");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        writer.Indent--;
+        writer.WriteLine("}");
+        writer.Indent--;
+        writer.WriteLine("}");
+
+        return stringWriter.ToString();
+    }
+
+    private static string RenderZigOffsets(
+        SortedDictionary<string, SortedDictionary<string, ulong>> offsets,
+        int indentSize)
+    {
+        using var stringWriter = new StringWriter();
+        using var writer = CreateWriter(stringWriter, indentSize);
+
+        writer.WriteLine("pub const amongus_dumper = struct {");
+        writer.Indent++;
+        writer.WriteLine("pub const offsets = struct {");
+        writer.Indent++;
+
+        foreach (var (moduleName, values) in offsets)
+        {
+            writer.WriteLine($"// Module: {moduleName}");
+            writer.WriteLine($"pub const {EscapeZigIdentifier(ToSnakeCase(moduleName))} = struct {{");
+            writer.Indent++;
+
+            foreach (var (name, value) in values)
+            {
+                writer.WriteLine($"pub const {EscapeZigIdentifier(name)}: usize = 0x{value:X};");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("};");
+        }
+
+        writer.Indent--;
+        writer.WriteLine("};");
+        writer.Indent--;
+        writer.WriteLine("};");
+
+        return stringWriter.ToString();
+    }
+
+    private static string RenderCsSchema(string moduleName, ModuleSchema schema, int indentSize)
+    {
+        using var stringWriter = new StringWriter();
+        using var writer = CreateWriter(stringWriter, indentSize);
+
+        writer.WriteLine("// Generated by Among Us dumper");
+        writer.WriteLine();
+        writer.WriteLine("namespace AmongUsDumper.Schemas");
+        writer.WriteLine("{");
+        writer.Indent++;
+        writer.WriteLine($"// Module: {moduleName}");
+        writer.WriteLine($"public static class {ToPascalCase(moduleName)}");
+        writer.WriteLine("{");
+        writer.Indent++;
+
+        foreach (var enumSchema in schema.Enums.Values)
+        {
+            writer.WriteLine($"// Namespace: {enumSchema.Namespace}");
+            writer.WriteLine($"public enum {SanitizeIdentifier(enumSchema.FullName)} : {MapCsType(enumSchema.UnderlyingType)}");
+            writer.WriteLine("{");
+            writer.Indent++;
+
+            foreach (var (name, value) in enumSchema.Members)
+            {
+                writer.WriteLine($"{SanitizeIdentifier(name)} = {FormatCsEnumValue(value, enumSchema.UnderlyingType)},");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        foreach (var classSchema in schema.Classes.Values)
+        {
+            WriteCsClass(writer, classSchema);
+        }
+
+        writer.Indent--;
+        writer.WriteLine("}");
+        writer.Indent--;
+        writer.WriteLine("}");
+
+        return stringWriter.ToString();
+    }
+
+    private static void WriteCsClass(IndentedTextWriter writer, ClassSchema classSchema)
+    {
+        writer.WriteLine($"// Namespace: {classSchema.Namespace}");
+        writer.WriteLine($"// Parent: {classSchema.Parent ?? "None"}");
+        writer.WriteLine($"// Size: 0x{classSchema.Size:X}");
+        writer.WriteLine($"public static class {SanitizeIdentifier(classSchema.FullName)}");
+        writer.WriteLine("{");
+        writer.Indent++;
+
+        foreach (var field in classSchema.Fields.Values)
+        {
+            writer.WriteLine($"public const nint {SanitizeIdentifier(field.Name)} = 0x{field.Offset:X}; // {field.TypeName}");
+        }
+
+        if (classSchema.StaticFields.Count > 0)
+        {
+            writer.WriteLine("public static class StaticFields");
+            writer.WriteLine("{");
+            writer.Indent++;
+
+            foreach (var field in classSchema.StaticFields.Values)
+            {
+                writer.WriteLine($"public const nint {SanitizeIdentifier(field.Name)} = 0x{field.Offset:X}; // {field.TypeName}");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        if (classSchema.Methods.Count > 0)
+        {
+            writer.WriteLine("public static class Methods");
+            writer.WriteLine("{");
+            writer.Indent++;
+
+            foreach (var (name, method) in classSchema.Methods)
+            {
+                writer.WriteLine($"public const nint {SanitizeIdentifier(name)} = 0x{method.Rva:X}; // {method.Signature}");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        writer.Indent--;
+        writer.WriteLine("}");
+    }
+
+    private static string RenderCppSchema(string moduleName, ModuleSchema schema, int indentSize)
+    {
+        using var stringWriter = new StringWriter();
+        using var writer = CreateWriter(stringWriter, indentSize);
+
+        writer.WriteLine("#pragma once");
+        writer.WriteLine();
+        writer.WriteLine("#include <cstddef>");
+        writer.WriteLine("#include <cstdint>");
+        writer.WriteLine();
+        writer.WriteLine("namespace amongus_dumper::schemas");
+        writer.WriteLine("{");
+        writer.Indent++;
+        writer.WriteLine($"// Module: {moduleName}");
+        writer.WriteLine($"namespace {ToSnakeCase(moduleName)}");
+        writer.WriteLine("{");
+        writer.Indent++;
+
+        foreach (var enumSchema in schema.Enums.Values)
+        {
+            writer.WriteLine($"// Namespace: {enumSchema.Namespace}");
+            writer.WriteLine($"enum class {SanitizeIdentifier(enumSchema.FullName)} : {MapCppType(enumSchema.UnderlyingType)}");
+            writer.WriteLine("{");
+            writer.Indent++;
+
+            foreach (var (name, value) in enumSchema.Members)
+            {
+                writer.WriteLine($"{SanitizeIdentifier(name)} = {FormatCppEnumValue(value)},");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("};");
+        }
+
+        foreach (var classSchema in schema.Classes.Values)
+        {
+            writer.WriteLine($"// Namespace: {classSchema.Namespace}");
+            writer.WriteLine($"// Parent: {classSchema.Parent ?? "None"}");
+            writer.WriteLine($"// Size: 0x{classSchema.Size:X}");
+            writer.WriteLine($"namespace {SanitizeIdentifier(classSchema.FullName)}");
+            writer.WriteLine("{");
+            writer.Indent++;
+
+            foreach (var field in classSchema.Fields.Values)
+            {
+                writer.WriteLine($"constexpr std::ptrdiff_t {SanitizeIdentifier(field.Name)} = 0x{field.Offset:X}; // {field.TypeName}");
+            }
+
+            if (classSchema.StaticFields.Count > 0)
+            {
+                writer.WriteLine("namespace static_fields");
+                writer.WriteLine("{");
+                writer.Indent++;
+
+                foreach (var field in classSchema.StaticFields.Values)
+                {
+                    writer.WriteLine($"constexpr std::ptrdiff_t {SanitizeIdentifier(field.Name)} = 0x{field.Offset:X}; // {field.TypeName}");
+                }
+
+                writer.Indent--;
+                writer.WriteLine("}");
+            }
+
+            if (classSchema.Methods.Count > 0)
+            {
+                writer.WriteLine("namespace methods");
+                writer.WriteLine("{");
+                writer.Indent++;
+
+                foreach (var (name, method) in classSchema.Methods)
+                {
+                    writer.WriteLine($"constexpr std::ptrdiff_t {SanitizeIdentifier(name)} = 0x{method.Rva:X}; // {method.Signature}");
+                }
+
+                writer.Indent--;
+                writer.WriteLine("}");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        writer.Indent--;
+        writer.WriteLine("}");
+        writer.Indent--;
+        writer.WriteLine("}");
+
+        return stringWriter.ToString();
+    }
+
+    private static string RenderRustSchema(string moduleName, ModuleSchema schema, int indentSize)
+    {
+        using var stringWriter = new StringWriter();
+        using var writer = CreateWriter(stringWriter, indentSize);
+
+        writer.WriteLine("#![allow(non_upper_case_globals, non_snake_case, unused)]");
+        writer.WriteLine();
+        writer.WriteLine("pub mod amongus_dumper {");
+        writer.Indent++;
+        writer.WriteLine("pub mod schemas {");
+        writer.Indent++;
+        writer.WriteLine($"// Module: {moduleName}");
+        writer.WriteLine($"pub mod {ToSnakeCase(moduleName)} {{");
+        writer.Indent++;
+
+        foreach (var enumSchema in schema.Enums.Values)
+        {
+            writer.WriteLine($"// Namespace: {enumSchema.Namespace}");
+            writer.WriteLine($"#[repr({MapRustType(enumSchema.UnderlyingType)})]");
+            writer.WriteLine($"pub enum {SanitizeIdentifier(enumSchema.FullName)} {{");
+            writer.Indent++;
+
+            foreach (var (name, value) in enumSchema.Members)
+            {
+                writer.WriteLine($"{SanitizeIdentifier(name)} = {FormatRustEnumValue(value, enumSchema.UnderlyingType)},");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        foreach (var classSchema in schema.Classes.Values)
+        {
+            writer.WriteLine($"// Namespace: {classSchema.Namespace}");
+            writer.WriteLine($"// Parent: {classSchema.Parent ?? "None"}");
+            writer.WriteLine($"// Size: 0x{classSchema.Size:X}");
+            writer.WriteLine($"pub mod {SanitizeIdentifier(classSchema.FullName)} {{");
+            writer.Indent++;
+
+            foreach (var field in classSchema.Fields.Values)
+            {
+                writer.WriteLine($"pub const {SanitizeIdentifier(field.Name)}: usize = 0x{field.Offset:X}; // {field.TypeName}");
+            }
+
+            if (classSchema.StaticFields.Count > 0)
+            {
+                writer.WriteLine("pub mod static_fields {");
+                writer.Indent++;
+
+                foreach (var field in classSchema.StaticFields.Values)
+                {
+                    writer.WriteLine($"pub const {SanitizeIdentifier(field.Name)}: usize = 0x{field.Offset:X}; // {field.TypeName}");
+                }
+
+                writer.Indent--;
+                writer.WriteLine("}");
+            }
+
+            if (classSchema.Methods.Count > 0)
+            {
+                writer.WriteLine("pub mod methods {");
+                writer.Indent++;
+
+                foreach (var (name, method) in classSchema.Methods)
+                {
+                    writer.WriteLine($"pub const {SanitizeIdentifier(name)}: usize = 0x{method.Rva:X}; // {method.Signature}");
+                }
+
+                writer.Indent--;
+                writer.WriteLine("}");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+        }
+
+        writer.Indent--;
+        writer.WriteLine("}");
+        writer.Indent--;
+        writer.WriteLine("}");
+        writer.Indent--;
+        writer.WriteLine("}");
+
+        return stringWriter.ToString();
+    }
+
+    private static string RenderZigSchema(string moduleName, ModuleSchema schema, int indentSize)
+    {
+        using var stringWriter = new StringWriter();
+        using var writer = CreateWriter(stringWriter, indentSize);
+
+        writer.WriteLine("pub const amongus_dumper = struct {");
+        writer.Indent++;
+        writer.WriteLine("pub const schemas = struct {");
+        writer.Indent++;
+        writer.WriteLine($"// Module: {moduleName}");
+        writer.WriteLine($"pub const {EscapeZigIdentifier(ToSnakeCase(moduleName))} = struct {{");
+        writer.Indent++;
+
+        foreach (var enumSchema in schema.Enums.Values)
+        {
+            writer.WriteLine($"// Namespace: {enumSchema.Namespace}");
+            writer.WriteLine($"pub const {EscapeZigIdentifier(enumSchema.FullName)} = enum({MapZigType(enumSchema.UnderlyingType)}) {{");
+            writer.Indent++;
+
+            foreach (var (name, value) in enumSchema.Members)
+            {
+                writer.WriteLine($"{EscapeZigIdentifier(name)} = {FormatZigEnumValue(value, enumSchema.UnderlyingType)},");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("};");
+        }
+
+        foreach (var classSchema in schema.Classes.Values)
+        {
+            writer.WriteLine($"// Namespace: {classSchema.Namespace}");
+            writer.WriteLine($"// Parent: {classSchema.Parent ?? "None"}");
+            writer.WriteLine($"// Size: 0x{classSchema.Size:X}");
+            writer.WriteLine($"pub const {EscapeZigIdentifier(classSchema.FullName)} = struct {{");
+            writer.Indent++;
+
+            foreach (var field in classSchema.Fields.Values)
+            {
+                writer.WriteLine($"pub const {EscapeZigIdentifier(field.Name)}: usize = 0x{field.Offset:X}; // {field.TypeName}");
+            }
+
+            if (classSchema.StaticFields.Count > 0)
+            {
+                writer.WriteLine("pub const static_fields = struct {");
+                writer.Indent++;
+
+                foreach (var field in classSchema.StaticFields.Values)
+                {
+                    writer.WriteLine($"pub const {EscapeZigIdentifier(field.Name)}: usize = 0x{field.Offset:X}; // {field.TypeName}");
+                }
+
+                writer.Indent--;
+                writer.WriteLine("};");
+            }
+
+            if (classSchema.Methods.Count > 0)
+            {
+                writer.WriteLine("pub const methods = struct {");
+                writer.Indent++;
+
+                foreach (var (name, method) in classSchema.Methods)
+                {
+                    writer.WriteLine($"pub const {EscapeZigIdentifier(name)}: usize = 0x{method.Rva:X}; // {method.Signature}");
+                }
+
+                writer.Indent--;
+                writer.WriteLine("};");
+            }
+
+            writer.Indent--;
+            writer.WriteLine("};");
+        }
+
+        writer.Indent--;
+        writer.WriteLine("};");
+        writer.Indent--;
+        writer.WriteLine("};");
+        writer.Indent--;
+        writer.WriteLine("};");
+
+        return stringWriter.ToString();
+    }
+
+    private static IndentedTextWriter CreateWriter(TextWriter textWriter, int indentSize)
+    {
+        return new IndentedTextWriter(textWriter, new string(' ', indentSize));
+    }
+
+    private static string Slugify(string value)
+    {
+        return string.Concat(value.Select(character => char.IsLetterOrDigit(character) ? character : '_'));
+    }
+
+    private static string ToPascalCase(string value)
+    {
+        var parts = Slugify(value)
+            .Split('_', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var transformed = parts.Select(part => char.ToUpperInvariant(part[0]) + part[1..]);
+        var result = string.Concat(transformed);
+
+        return string.IsNullOrWhiteSpace(result) ? "UnknownModule" : SanitizeIdentifier(result);
+    }
+
+    private static string ToSnakeCase(string value)
+    {
+        var slug = Slugify(value).Trim('_').ToLowerInvariant();
+        return string.IsNullOrWhiteSpace(slug) ? "unknown_module" : slug;
+    }
+
+    private static string SanitizeIdentifier(string value)
+    {
+        var characters = value.Select(character => char.IsLetterOrDigit(character) ? character : '_').ToArray();
+        var result = new string(characters).Trim('_');
+
+        if (string.IsNullOrWhiteSpace(result))
+        {
+            return "value";
+        }
+
+        if (char.IsDigit(result[0]))
+        {
+            result = "_" + result;
+        }
+
+        return result;
+    }
+
+    private static string EscapeZigIdentifier(string value)
+    {
+        var identifier = SanitizeIdentifier(value);
+
+        return identifier switch
+        {
+            "fn" or "struct" or "const" or "enum" or "pub" or "error" or "test" => $"@\"{identifier}\"",
+            _ => identifier,
+        };
+    }
+
+    private static string MapCsType(string typeName)
+    {
+        return typeName switch
+        {
+            "sbyte" => "sbyte",
+            "byte" => "byte",
+            "short" => "short",
+            "ushort" => "ushort",
+            "int" => "int",
+            "uint" => "uint",
+            "long" => "long",
+            "ulong" => "ulong",
+            _ => "int",
+        };
+    }
+
+    private static string MapCppType(string typeName)
+    {
+        return typeName switch
+        {
+            "sbyte" => "int8_t",
+            "byte" => "uint8_t",
+            "short" => "int16_t",
+            "ushort" => "uint16_t",
+            "int" => "int32_t",
+            "uint" => "uint32_t",
+            "long" => "int64_t",
+            "ulong" => "uint64_t",
+            _ => "int32_t",
+        };
+    }
+
+    private static string MapRustType(string typeName)
+    {
+        return typeName switch
+        {
+            "sbyte" => "i8",
+            "byte" => "u8",
+            "short" => "i16",
+            "ushort" => "u16",
+            "int" => "i32",
+            "uint" => "u32",
+            "long" => "i64",
+            "ulong" => "u64",
+            _ => "i32",
+        };
+    }
+
+    private static string MapZigType(string typeName)
+    {
+        return typeName switch
+        {
+            "sbyte" => "i8",
+            "byte" => "u8",
+            "short" => "i16",
+            "ushort" => "u16",
+            "int" => "i32",
+            "uint" => "u32",
+            "long" => "i64",
+            "ulong" => "u64",
+            _ => "i32",
+        };
+    }
+
+    private static string FormatCsEnumValue(long value, string typeName)
+    {
+        return value >= 0
+            ? $"0x{value:X}"
+            : $"unchecked(({MapCsType(typeName)}){value})";
+    }
+
+    private static string FormatCppEnumValue(long value)
+    {
+        return value >= 0 ? $"0x{value:X}" : value.ToString();
+    }
+
+    private static string FormatRustEnumValue(long value, string typeName)
+    {
+        if (value >= 0)
+        {
+            return $"0x{value:X}";
+        }
+
+        return typeName switch
+        {
+            "byte" => $"0x{unchecked((byte)value):X}",
+            "ushort" => $"0x{unchecked((ushort)value):X}",
+            "uint" => $"0x{unchecked((uint)value):X}",
+            "ulong" => $"0x{unchecked((ulong)value):X}",
+            _ => value.ToString(),
+        };
+    }
+
+    private static string FormatZigEnumValue(long value, string typeName)
+    {
+        if (value >= 0)
+        {
+            return $"0x{value:X}";
+        }
+
+        return typeName switch
+        {
+            "byte" => $"0x{unchecked((byte)value):X}",
+            "ushort" => $"0x{unchecked((ushort)value):X}",
+            "uint" => $"0x{unchecked((uint)value):X}",
+            "ulong" => $"0x{unchecked((ulong)value):X}",
+            _ => value.ToString(),
+        };
+    }
+}

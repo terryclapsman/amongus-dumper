@@ -1,0 +1,12 @@
+.tools/
+.vs/
+.idea/
+
+**/bin/
+**/obj/
+**/Output/
+**/output/
+
+*.log
+*.user
+*.suo
